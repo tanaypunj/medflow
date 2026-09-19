@@ -33,7 +33,6 @@ CONDITIONS = [
     ("Fracture", "Routine", 2, {"Beds": 1, "Doctors": 1, "Nurses": 1}),
     ("Infection", "Routine", 2, {"Beds": 1, "Doctors": 1, "Nurses": 1}),
 ]
-PRIORITY = {"Critical": 0, "Urgent": 1, "Routine": 2}
 
 
 def seed_patients():
@@ -42,21 +41,14 @@ def seed_patients():
     patients = []
     for index, name in enumerate(names):
         condition, acuity, priority, requirements = CONDITIONS[index % len(CONDITIONS)]
-        patients.append(
-            {
-                "id": f"P-{index + 1:03d}",
-                "name": name,
-                "condition": condition,
-                "acuity": acuity,
-                "priority": priority,
-                "arrival": now - timedelta(minutes=(index + 1) * 12),
-                "requirements": requirements.copy(),
-                "status": "Waiting",
-                "admitted_at": None,
-                "waiting_minutes": 0,
-                "reason": "Not yet assessed",
-            }
-        )
+        patients.append({
+            "id": f"P-{index + 1:03d}", "name": name, "condition": condition,
+            "acuity": acuity, "priority": priority,
+            "arrival": now - timedelta(minutes=(index + 1) * 12),
+            "requirements": requirements.copy(), "status": "Waiting",
+            "admitted_at": None, "discharged_at": None, "waiting_minutes": 0,
+            "reason": "Not yet assessed",
+        })
     return patients
 
 
@@ -65,7 +57,6 @@ def initialize():
     st.session_state.patients = seed_patients()
     st.session_state.resources = {name: {"total": total, "failed": 0} for name, total in RESOURCE_DEFAULTS.items()}
     st.session_state.mode = "Normal"
-    st.session_state.alerts = []
     st.session_state.event_log = ["Simulation initialized"]
     st.session_state.ticks = 0
 
@@ -73,6 +64,9 @@ def initialize():
 def ensure_state():
     if "patients" not in st.session_state:
         initialize()
+    # Keep sessions created by earlier versions compatible.
+    for patient in st.session_state.patients:
+        patient.setdefault("discharged_at", None)
 
 
 def effective_capacity(name):
@@ -104,7 +98,7 @@ def refresh_waiting_times():
 
 def allocate_patients():
     refresh_waiting_times()
-    admitted = 0
+    admitted_count = 0
     waiting = sorted(
         [p for p in st.session_state.patients if p["status"] == "Waiting"],
         key=lambda p: (p["priority"], p["arrival"]),
@@ -115,29 +109,40 @@ def allocate_patients():
             patient["status"] = "Admitted"
             patient["admitted_at"] = st.session_state.clock
             patient["reason"] = "Allocated successfully"
-            admitted += 1
+            admitted_count += 1
         else:
             patient["reason"] = "Waiting for " + ", ".join(blocked)
-    return admitted
+    return admitted_count
+
+
+def discharge_patient(patient_id):
+    """Discharge one admitted patient; their requirements stop counting as used."""
+    for patient in st.session_state.patients:
+        if patient["id"] == patient_id and patient["status"] == "Admitted":
+            patient["status"] = "Discharged"
+            patient["discharged_at"] = st.session_state.clock
+            st.session_state.event_log.insert(0, f"{patient['id']} ({patient['name']}) was discharged; resources released.")
+            return True
+    return False
+
+
+def discharge_selected(patient_ids):
+    count = sum(discharge_patient(patient_id) for patient_id in patient_ids)
+    if count:
+        allocate_patients()
+    return count
 
 
 def add_patient():
     index = len(st.session_state.patients) + 1
     condition, acuity, priority, requirements = random.choice(CONDITIONS)
-    patient = {
-        "id": f"P-{index:03d}",
-        "name": f"Simulated patient {index}",
-        "condition": condition,
-        "acuity": acuity,
-        "priority": priority,
-        "arrival": st.session_state.clock,
-        "requirements": requirements.copy(),
-        "status": "Waiting",
-        "admitted_at": None,
-        "waiting_minutes": 0,
-        "reason": "Not yet assessed",
-    }
-    st.session_state.patients.append(patient)
+    st.session_state.patients.append({
+        "id": f"P-{index:03d}", "name": f"Simulated patient {index}",
+        "condition": condition, "acuity": acuity, "priority": priority,
+        "arrival": st.session_state.clock, "requirements": requirements.copy(),
+        "status": "Waiting", "admitted_at": None, "discharged_at": None,
+        "waiting_minutes": 0, "reason": "Not yet assessed",
+    })
 
 
 def simulate_failure():
@@ -159,13 +164,12 @@ def advance_simulation():
         st.session_state.event_log.insert(0, "A new emergency arrival entered the waiting list.")
     if random.random() < 0.18:
         simulate_failure()
-    admitted = allocate_patients()
-    st.session_state.event_log.insert(0, f"Advanced to {st.session_state.clock:%H:%M}; admitted {admitted} patient(s).")
+    admitted_count = allocate_patients()
+    st.session_state.event_log.insert(0, f"Advanced to {st.session_state.clock:%H:%M}; admitted {admitted_count} patient(s).")
 
 
 ensure_state()
 
-# Sidebar controls
 st.sidebar.title("⚙️ Simulation controls")
 mode = st.sidebar.selectbox("Operating mode", list(MODE_LABELS), index=list(MODE_LABELS).index(st.session_state.mode), format_func=lambda value: f"{value} — {MODE_LABELS[value]}")
 if mode != st.session_state.mode:
@@ -198,36 +202,33 @@ st.title("🏥 MedFlow")
 st.caption("Hospital management and resource-allocation simulation")
 st.info(f"Simulation time: **{st.session_state.clock:%Y-%m-%d %H:%M}**  ·  Mode: **{st.session_state.mode}**  ·  Tick: **{st.session_state.ticks}**")
 
-# Resource editor
 st.subheader("Hospital resources")
 st.caption("Change total capacity below. Used capacity is calculated from admitted patients; failed units are unavailable.")
 resource_columns = st.columns(3)
 for index, name in enumerate(st.session_state.resources):
     resource = st.session_state.resources[name]
     with resource_columns[index % 3]:
-        new_total = st.number_input(f"{name} — total", min_value=0, max_value=200, value=int(resource["total"]), key=f"total_{name}")
-        resource["total"] = new_total
+        resource["total"] = st.number_input(f"{name} — total", min_value=0, max_value=200, value=int(resource["total"]), key=f"total_{name}")
         used = current_usage(name)
-        available = available_capacity(name)
-        st.metric("Available", available, delta=f"{used} used")
+        st.metric("Available", available_capacity(name), delta=f"{used} used")
         if resource["failed"]:
             st.caption(f"⚠️ Failed units: {resource['failed']}")
 
-# Summary metrics
 waiting = [p for p in st.session_state.patients if p["status"] == "Waiting"]
 admitted = [p for p in st.session_state.patients if p["status"] == "Admitted"]
+discharged = [p for p in st.session_state.patients if p["status"] == "Discharged"]
+refresh_waiting_times()
 avg_wait = sum(p["waiting_minutes"] for p in waiting) / len(waiting) if waiting else 0
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Waiting", len(waiting))
 m2.metric("Currently admitted", len(admitted))
 m3.metric("Average waiting time", f"{avg_wait:.0f} min")
-m4.metric("Active failures", sum(r["failed"] for r in st.session_state.resources.values()))
+m4.metric("Discharged", len(discharged))
 
 st.subheader("Patient flow")
-tab_waiting, tab_admitted, tab_resources, tab_events = st.tabs(["🕒 Waiting list", "🛏️ Currently admitted", "📊 Resource utilization", "📋 Event log"])
+tab_waiting, tab_admitted, tab_discharged, tab_resources, tab_events = st.tabs(["🕒 Waiting list", "🛏️ Currently admitted", "✅ Discharged", "📊 Resource utilization", "📋 Event log"])
 
 with tab_waiting:
-    refresh_waiting_times()
     if waiting:
         rows = []
         for position, patient in enumerate(sorted(waiting, key=lambda p: (p["priority"], p["arrival"])), 1):
@@ -238,10 +239,23 @@ with tab_waiting:
 
 with tab_admitted:
     if admitted:
+        st.caption("Select one or more patients, then discharge them. All resources assigned to them are immediately released and waiting patients are re-evaluated.")
+        selected = st.multiselect("Patients to discharge", options=[p["id"] for p in admitted], format_func=lambda patient_id: next(p["name"] + " (" + patient_id + ")" for p in admitted if p["id"] == patient_id), key="discharge_selection")
+        if st.button("✅ Discharge selected patient(s)", type="primary", disabled=not selected):
+            count = discharge_selected(selected)
+            st.success(f"Discharged {count} patient(s); their resources are now available.")
+            st.rerun()
         rows = [{"ID": p["id"], "Patient": p["name"], "Condition": p["condition"], "Acuity": p["acuity"], "Admitted": p["admitted_at"].strftime("%H:%M"), "Resources": ", ".join(f"{k}: {v}" for k, v in p["requirements"].items())} for p in admitted]
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     else:
         st.warning("No patients are currently admitted.")
+
+with tab_discharged:
+    if discharged:
+        rows = [{"ID": p["id"], "Patient": p["name"], "Condition": p["condition"], "Admitted": p["admitted_at"].strftime("%H:%M"), "Discharged": p["discharged_at"].strftime("%H:%M")} for p in discharged]
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("No patients have been discharged yet.")
 
 with tab_resources:
     rows = []
@@ -256,8 +270,6 @@ with tab_events:
     for event in st.session_state.event_log[:12]:
         st.write(f"• {event}")
 
-# Silent alarm deliberately placed at the bottom of the UI.
-refresh_waiting_times()
 shortages = []
 for name, resource in st.session_state.resources.items():
     if resource["failed"] > 0:
