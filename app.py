@@ -9,7 +9,7 @@ from streamlit_autorefresh import st_autorefresh
 st.set_page_config(page_title="MedFlow", page_icon="🏥", layout="wide")
 
 RESOURCE_DEFAULTS = {"Beds": 30, "ICU beds": 6, "Doctors": 8, "Nurses": 16, "Operating rooms": 3, "Ventilators": 5}
-MODE_LABELS = {"Normal": "Routine operations", "Emergency surge": "Higher emergency arrivals and acuity", "Staff shortage": "Reduced clinical staffing", "Resource shortage": "Reduced beds and equipment", "Disaster": "Severe surge with multiple constraints", "Custom": "Use configured resources"}
+MODE_LABELS = {"Normal": "Routine operations", "Emergency surge": "Higher emergency arrivals and acuity", "Staff shortage": "Reduced clinical staffing", "Resource shortage": "Reduced beds and equipment capacity", "Disaster": "Mass-casualty event"}
 ARRIVAL_INTERVALS = {"Normal": 30, "Emergency surge": 5, "Staff shortage": 15, "Resource shortage": 12, "Disaster": 2, "Custom": 20}
 CONDITIONS = [
     ("Cardiac event", "Critical", 4, {"Beds": 1, "ICU beds": 1, "Doctors": 1, "Nurses": 2}),
@@ -233,7 +233,15 @@ if mode != st.session_state.mode:
     st.session_state.mode = mode
     st.session_state.arrival_accumulator = 0.0
 
-st.session_state.speed = st.sidebar.number_input("Simulation speed", min_value=0.1, max_value=500.0, value=float(st.session_state.speed), step=0.1, format="%.1fx", help="Simulated time multiplier. Maximum 500×.")
+st.session_state.speed = st.sidebar.number_input(
+    "Simulation speed",
+    min_value=0.1,
+    max_value=500.0,
+    value=float(st.session_state.speed),
+    step=0.1,
+    format="%.1f",
+    help="Simulated time multiplier. Maximum 500×.",
+)
 st.sidebar.caption("Patient statuses are evaluated every 30 simulated seconds. Patients arrive automatically based on the selected mode.")
 
 skip_columns = st.sidebar.columns(5)
@@ -277,7 +285,7 @@ m4.metric("Discharged", len(discharged))
 st.subheader("Patient flow")
 tab_wait, tab_admit, tab_dis, tab_res, tab_log = st.tabs(["🕒 Waiting list", "🛏️ Currently admitted", "✅ Discharged", "📊 Resource utilization", "📋 Event log"])
 with tab_wait:
-    rows = [{"#": i, "ID": p["id"], "Patient": p["name"], "Condition": p["condition"], "Acuity": p["acuity"], "Remaining wait": f"{p['waiting_seconds'] / 60:.1f} min", "Doctor availability": f"{available_capacity('Doctors')}/{p['requirements'].get('Doctors', 1)}", "Why waiting": p["reason"]} for i, p in enumerate(sorted(waiting, key=lambda p: (p["priority"], p["arrival"])), 1)]
+    rows = [{"#": i, "ID": p["id"], "Patient": p["name"], "Condition": p["condition"], "Acuity": p["acuity"], "Remaining wait": f"{p['waiting_seconds'] / 60:.1f} min", "Doctor availability": f"{available_capacity('Doctors')}/{p['requirements'].get('Doctors', 1)}"} for i, p in enumerate(sorted(waiting, key=lambda p: p['waiting_seconds'], reverse=True), start=1)]
     if rows:
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     else:
@@ -285,24 +293,24 @@ with tab_wait:
 with tab_admit:
     if admitted:
         ordered = sorted(admitted, key=lambda p: (DISCHARGE_PRIORITY.get(p["acuity"], 99), -stay_minutes(p)))
-        selected = st.multiselect("Patients to discharge", [p["id"] for p in ordered], format_func=lambda pid: next(f"{p['name']} ({pid}) — {p['location']} — {stay_minutes(p)} min" for p in ordered if p["id"] == pid), key="discharge_selection")
+        selected = st.multiselect("Patients to discharge", [p["id"] for p in ordered], format_func=lambda pid: next(f"{p['name']} ({pid}) — {p['location']} — {stay_minutes(p)} min" for p in ordered if p["id"] == pid))
         if st.button("✅ Discharge selected patient(s)", type="primary", disabled=not selected):
             for pid in selected:
                 discharge_patient(pid)
             allocate_patients()
             st.rerun()
-        admitted_rows = [{"ID": p["id"], "Patient": p["name"], "Condition": p["condition"], "Acuity": p["acuity"], "Location": p["location"], "Stay": f"{stay_minutes(p)} min", "Resources": ", ".join(f"{k}: {v}" for k, v in p["requirements"].items())} for p in ordered]
+        admitted_rows = [{"ID": p["id"], "Patient": p["name"], "Condition": p["condition"], "Acuity": p["acuity"], "Location": p["location"], "Stay": f"{stay_minutes(p)} min", "Resources": ", ".join(f"{name}:{qty}" for name, qty in p['requirements'].items())} for p in ordered]
         st.dataframe(pd.DataFrame(admitted_rows), use_container_width=True, hide_index=True)
     else:
         st.warning("No patients are currently admitted.")
 with tab_dis:
-    discharged_rows = [{"ID": p["id"], "Patient": p["name"], "Condition": p["condition"], "Acuity": p["acuity"], "Discharged": p["discharged_at"].strftime("%H:%M:%S")} for p in discharged if p.get("discharged_at") is not None]
+    discharged_rows = [{"ID": p["id"], "Patient": p["name"], "Condition": p["condition"], "Acuity": p["acuity"], "Discharged": p["discharged_at"].strftime("%H:%M:%S")} for p in discharged if p.get("discharged_at")]
     if discharged_rows:
         st.dataframe(pd.DataFrame(discharged_rows), use_container_width=True, hide_index=True)
     else:
         st.info("No patients have been discharged yet.")
 with tab_res:
-    resource_rows = [{"Resource": name, "Total": resource["total"], "Used": current_usage(name), "Failed": resource["failed"], "Available": available_capacity(name), "Utilization": f"{(current_usage(name) / resource['total'] * 100) if resource['total'] else 0:.0f}%"} for name, resource in st.session_state.resources.items()]
+    resource_rows = [{"Resource": name, "Total": resource["total"], "Used": current_usage(name), "Failed": resource["failed"], "Available": available_capacity(name), "Utilization": f"{(current_usage(name) / resource['total'] * 100 if resource['total'] else 0):.0f}%"} for name, resource in st.session_state.resources.items()]
     st.dataframe(pd.DataFrame(resource_rows), use_container_width=True, hide_index=True)
 with tab_log:
     for event in st.session_state.event_log[:12]:
