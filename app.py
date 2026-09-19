@@ -1,13 +1,16 @@
 import random
+import time
 from datetime import datetime, timedelta
 
 import pandas as pd
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 st.set_page_config(page_title="MedFlow", page_icon="🏥", layout="wide")
 
 RESOURCE_DEFAULTS = {"Beds": 30, "ICU beds": 6, "Doctors": 8, "Nurses": 16, "Operating rooms": 3, "Ventilators": 5}
 MODE_LABELS = {"Normal": "Routine operations", "Emergency surge": "Higher emergency arrivals and acuity", "Staff shortage": "Reduced clinical staffing", "Resource shortage": "Reduced beds and equipment", "Disaster": "Severe surge with multiple constraints", "Custom": "Use configured resources"}
+ARRIVAL_INTERVALS = {"Normal": 30, "Emergency surge": 5, "Staff shortage": 15, "Resource shortage": 12, "Disaster": 2, "Custom": 20}
 CONDITIONS = [
     ("Cardiac event", "Critical", 4, {"Beds": 1, "ICU beds": 1, "Doctors": 1, "Nurses": 2}),
     ("Respiratory distress", "Critical", 4, {"Beds": 1, "ICU beds": 1, "Doctors": 1, "Nurses": 2, "Ventilators": 1}),
@@ -16,42 +19,49 @@ CONDITIONS = [
     ("Fracture", "Routine", 2, {"Beds": 1, "Doctors": 1, "Nurses": 1}),
     ("Infection", "Routine", 2, {"Beds": 1, "Doctors": 1, "Nurses": 1}),
 ]
-DISCHARGE_PRIORITY = {"Routine": 0, "Urgent": 1, "Critical": 2}
 DISCHARGE_MINUTES = {"Routine": 90, "Urgent": 150, "Critical": 240}
+DISCHARGE_PRIORITY = {"Routine": 0, "Urgent": 1, "Critical": 2}
 CRITICAL_TRANSFER_MINUTES = 120
 
 
-def patient_record(patient_id, name, condition, acuity, priority, requirements, arrival):
-    return {"id": patient_id, "name": name, "condition": condition, "acuity": acuity, "priority": priority,
-            "arrival": arrival, "requirements": requirements.copy(), "base_requirements": requirements.copy(),
-            "status": "Waiting", "location": "Waiting list", "admitted_at": None, "discharged_at": None,
-            "waiting_minutes": 0, "reason": "Not yet assessed"}
+def patient_record(pid, name, condition, acuity, priority, requirements, arrival, initial_wait=0):
+    return {"id": pid, "name": name, "condition": condition, "acuity": acuity, "priority": priority, "arrival": arrival,
+            "requirements": requirements.copy(), "base_requirements": requirements.copy(), "status": "Waiting",
+            "location": "Waiting list", "admitted_at": None, "discharged_at": None,
+            "waiting_seconds": initial_wait, "reason": "Not yet assessed"}
 
 
 def seed_patients():
-    now = datetime.now().replace(second=0, microsecond=0)
+    now = datetime.now().replace(microsecond=0)
     names = ["A. Patel", "B. Williams", "C. Garcia", "D. Chen", "E. Smith", "F. Okafor", "G. Jones", "H. Khan"]
-    return [patient_record(f"P-{i + 1:03d}", name, *CONDITIONS[i % len(CONDITIONS)], now - timedelta(minutes=(i + 1) * 12)) for i, name in enumerate(names)]
+    return [patient_record(f"P-{i + 1:03d}", name, *CONDITIONS[i % len(CONDITIONS)], now - timedelta(minutes=(i + 1) * 12), (i + 1) * 12 * 60) for i, name in enumerate(names)]
 
 
 def initialize():
-    st.session_state.clock = datetime.now().replace(second=0, microsecond=0)
+    st.session_state.clock = datetime.now().replace(microsecond=0)
     st.session_state.patients = seed_patients()
     st.session_state.resources = {name: {"total": total, "failed": 0, "repair_at": None} for name, total in RESOURCE_DEFAULTS.items()}
     st.session_state.mode = "Normal"
+    st.session_state.speed = 1.0
     st.session_state.event_log = ["Simulation initialized"]
     st.session_state.ticks = 0
+    st.session_state.arrival_accumulator = 0.0
+    st.session_state.last_wall_time = time.monotonic()
 
 
 def ensure_state():
     if "patients" not in st.session_state:
         initialize()
     for p in st.session_state.patients:
-        p.setdefault("discharged_at", None)
-        p.setdefault("location", "ICU" if p.get("status") == "Admitted" and p.get("acuity") == "Critical" else "Normal bed")
+        p.setdefault("waiting_seconds", p.get("waiting_minutes", 0) * 60)
+        p.setdefault("location", "Waiting list")
         p.setdefault("base_requirements", p.get("requirements", {}).copy())
+        p.setdefault("discharged_at", None)
     for resource in st.session_state.resources.values():
         resource.setdefault("repair_at", None)
+    st.session_state.setdefault("speed", 1.0)
+    st.session_state.setdefault("arrival_accumulator", 0.0)
+    st.session_state.setdefault("last_wall_time", time.monotonic())
 
 
 def effective_capacity(name):
@@ -67,162 +77,160 @@ def available_capacity(name):
     return max(0, effective_capacity(name) - current_usage(name))
 
 
-def refresh_waiting_times():
-    for p in st.session_state.patients:
-        if p["status"] == "Waiting":
-            p["waiting_minutes"] = max(0, int((st.session_state.clock - p["arrival"]).total_seconds() // 60))
-
-
-def stay_minutes(p):
-    if p["admitted_at"] is None:
+def stay_minutes(patient):
+    if patient["admitted_at"] is None:
         return 0
-    return max(0, int(((p["discharged_at"] or st.session_state.clock) - p["admitted_at"]).total_seconds() // 60))
+    return max(0, int(((patient["discharged_at"] or st.session_state.clock) - patient["admitted_at"]).total_seconds() // 60))
 
 
-def can_admit(p):
-    return [f"{name} ({available_capacity(name)}/{needed})" for name, needed in p["requirements"].items() if available_capacity(name) < needed]
+def can_admit(patient):
+    return [f"{name} ({available_capacity(name)}/{needed})" for name, needed in patient["requirements"].items() if available_capacity(name) < needed]
 
 
 def allocate_patients():
-    refresh_waiting_times()
     count = 0
     waiting = sorted((p for p in st.session_state.patients if p["status"] == "Waiting"), key=lambda p: (p["priority"], p["arrival"]))
-    for p in waiting:
-        blocked = can_admit(p)
+    for patient in waiting:
+        blocked = can_admit(patient)
         if blocked:
-            p["reason"] = "Waiting for " + ", ".join(blocked)
+            patient["reason"] = "Waiting for " + ", ".join(blocked)
             continue
-        p["status"] = "Admitted"
-        p["location"] = "ICU" if p["acuity"] == "Critical" and "ICU beds" in p["requirements"] else "Normal bed"
-        p["admitted_at"] = st.session_state.clock
-        p["reason"] = "Allocated successfully"
+        patient["status"] = "Admitted"
+        patient["location"] = "ICU" if patient["acuity"] == "Critical" and "ICU beds" in patient["requirements"] else "Normal bed"
+        patient["admitted_at"] = st.session_state.clock
+        patient["reason"] = "Allocated successfully"
         count += 1
     return count
 
 
-def discharge_patient(patient_id):
-    for p in st.session_state.patients:
-        if p["id"] == patient_id and p["status"] == "Admitted":
-            old_location = p["location"]
-            p["status"] = "Discharged"
-            p["discharged_at"] = st.session_state.clock
-            p["location"] = "Discharged"
-            st.session_state.event_log.insert(0, f"{p['id']} ({p['name']}) discharged from {old_location}; resources released.")
+def discharge_patient(pid):
+    for patient in st.session_state.patients:
+        if patient["id"] == pid and patient["status"] == "Admitted":
+            old_location = patient["location"]
+            patient["status"] = "Discharged"
+            patient["discharged_at"] = st.session_state.clock
+            patient["location"] = "Discharged"
+            st.session_state.event_log.insert(0, f"{patient['id']} ({patient['name']}) discharged from {old_location}; resources released.")
             return True
     return False
-
-
-def discharge_selected(ids):
-    count = sum(discharge_patient(pid) for pid in ids)
-    if count:
-        allocate_patients()
-    return count
 
 
 def repair_resources():
     for name, resource in st.session_state.resources.items():
         if resource["repair_at"] and st.session_state.clock >= resource["repair_at"]:
-            repaired = resource["failed"]
+            failed = resource["failed"]
             resource["failed"] = 0
             resource["repair_at"] = None
-            st.session_state.event_log.insert(0, f"{name} repair completed; {repaired} unit(s) restored.")
+            st.session_state.event_log.insert(0, f"{name} repair completed; {failed} unit(s) restored.")
 
 
 def transfer_critical_patients():
-    for p in st.session_state.patients:
-        if p["status"] != "Admitted" or p["acuity"] != "Critical" or p["location"] != "ICU":
+    for patient in st.session_state.patients:
+        if patient["status"] != "Admitted" or patient["acuity"] != "Critical" or patient["location"] != "ICU":
             continue
-        if stay_minutes(p) < CRITICAL_TRANSFER_MINUTES or available_capacity("Beds") < 1:
+        if stay_minutes(patient) < CRITICAL_TRANSFER_MINUTES or available_capacity("Beds") < 1:
             continue
-        p["requirements"] = p["base_requirements"].copy()
-        p["requirements"].pop("ICU beds", None)
-        p["requirements"].pop("Ventilators", None)
-        p["requirements"]["Beds"] = 1
-        p["location"] = "Normal bed"
-        st.session_state.event_log.insert(0, f"{p['id']} transferred from ICU to a normal bed after {stay_minutes(p)} minutes.")
+        patient["requirements"] = patient["base_requirements"].copy()
+        patient["requirements"].pop("ICU beds", None)
+        patient["requirements"].pop("Ventilators", None)
+        patient["requirements"]["Beds"] = 1
+        patient["location"] = "Normal bed"
+        st.session_state.event_log.insert(0, f"{patient['id']} transferred from ICU to a normal bed.")
 
 
 def auto_discharge():
     ordered = sorted((p for p in st.session_state.patients if p["status"] == "Admitted"), key=lambda p: (DISCHARGE_PRIORITY.get(p["acuity"], 99), -stay_minutes(p)))
     count = 0
-    for p in ordered:
-        if p["acuity"] == "Critical" and p["location"] != "Normal bed":
+    for patient in ordered:
+        if patient["acuity"] == "Critical" and patient["location"] != "Normal bed":
             continue
-        if stay_minutes(p) >= DISCHARGE_MINUTES.get(p["acuity"], 9999) and discharge_patient(p["id"]):
+        if stay_minutes(patient) >= DISCHARGE_MINUTES.get(patient["acuity"], 9999) and discharge_patient(patient["id"]):
             count += 1
-    if count:
-        allocate_patients()
     return count
 
 
 def add_patient():
-    i = len(st.session_state.patients) + 1
+    number = len(st.session_state.patients) + 1
     condition, acuity, priority, requirements = random.choice(CONDITIONS)
-    st.session_state.patients.append(patient_record(f"P-{i:03d}", f"Simulated patient {i}", condition, acuity, priority, requirements, st.session_state.clock))
+    patient = patient_record(f"P-{number:03d}", f"Simulated patient {number}", condition, acuity, priority, requirements, st.session_state.clock)
+    st.session_state.patients.append(patient)
+    st.session_state.event_log.insert(0, f"New {acuity.lower()} patient arrived automatically: {patient['id']} ({patient['condition']}).")
 
 
 def simulate_failure():
     candidates = [name for name, resource in st.session_state.resources.items() if name != "Beds" and resource["total"] - resource["failed"] > 0]
     if not candidates:
-        return "No eligible operational resource is available to fail."
+        return
     name = random.choice(candidates)
     resource = st.session_state.resources[name]
     resource["failed"] += 1
     if name == "ICU beds":
         hours = random.randint(1, 3)
         resource["repair_at"] = st.session_state.clock + timedelta(hours=hours)
-        message = f"Unexpected ICU failure; repair due in {hours} hour(s)."
+        message = f"Unexpected ICU failure; repair due in {hours} simulated hour(s)."
     else:
         message = f"Unexpected failure: one {name} became unavailable."
     st.session_state.event_log.insert(0, message)
-    return message
 
 
-def evaluate_patients(minutes):
-    """Advance the simulation in 30-second evaluation steps, then render one update."""
-    steps = max(1, int(minutes * 60 / 30))
+def advance_simulation(simulated_seconds):
+    """Advance in 30-second evaluation steps; waiting countdowns decrease with simulated time."""
+    steps = max(1, int(simulated_seconds // 30))
     for _ in range(steps):
         st.session_state.clock += timedelta(seconds=30)
+        for patient in st.session_state.patients:
+            if patient["status"] == "Waiting":
+                patient["waiting_seconds"] = max(0, patient["waiting_seconds"] - 30)
+        st.session_state.arrival_accumulator += 30 / 60
+        interval = ARRIVAL_INTERVALS[st.session_state.mode]
+        while st.session_state.arrival_accumulator >= interval:
+            st.session_state.arrival_accumulator -= interval
+            add_patient()
         repair_resources()
         transfer_critical_patients()
         auto_discharge()
         allocate_patients()
     st.session_state.ticks += steps
-    st.session_state.event_log.insert(0, f"Evaluated patients for {minutes} minute(s) in {steps} thirty-second step(s).")
+
+
+def update_from_real_clock():
+    now = time.monotonic()
+    elapsed = max(0.0, min(now - st.session_state.last_wall_time, 5.0))
+    st.session_state.last_wall_time = now
+    if elapsed > 0:
+        advance_simulation(elapsed * st.session_state.speed)
 
 
 ensure_state()
+
+# Refresh once per real second so the simulation runs continuously.
+st_autorefresh(interval=1000, key="medflow_clock")
+update_from_real_clock()
+
 st.sidebar.title("⚙️ Simulation controls")
 mode = st.sidebar.selectbox("Operating mode", list(MODE_LABELS), index=list(MODE_LABELS).index(st.session_state.mode), format_func=lambda x: f"{x} — {MODE_LABELS[x]}")
 if mode != st.session_state.mode:
     st.session_state.mode = mode
-    if mode == "Staff shortage":
-        st.session_state.resources["Doctors"]["total"] = max(1, RESOURCE_DEFAULTS["Doctors"] // 2)
-        st.session_state.resources["Nurses"]["total"] = max(1, RESOURCE_DEFAULTS["Nurses"] // 2)
-    elif mode == "Resource shortage":
-        for name in ("ICU beds", "Ventilators"):
-            st.session_state.resources[name]["total"] = max(1, RESOURCE_DEFAULTS[name] // 2)
-    elif mode == "Disaster":
-        for name in ("Doctors", "Nurses", "ICU beds"):
-            st.session_state.resources[name]["total"] = max(1, RESOURCE_DEFAULTS[name] // 2)
-st.sidebar.caption(MODE_LABELS[st.session_state.mode])
-st.sidebar.caption("Patient status is evaluated every 30 simulated seconds.")
+    st.session_state.arrival_accumulator = 0.0
+
+speed_options = [1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0]
+st.session_state.speed = st.sidebar.select_slider("Simulation speed", options=speed_options, value=st.session_state.speed, format_func=lambda x: f"{x:g}×")
+st.sidebar.caption("The simulation clock advances continuously using the real clock. Patients arrive automatically according to the selected mode.")
 
 skip_columns = st.sidebar.columns(5)
 for column, minutes in zip(skip_columns, (1, 5, 10, 15, 20)):
     if column.button(f"+{minutes}m", key=f"skip_{minutes}", use_container_width=True):
-        evaluate_patients(minutes)
+        advance_simulation(minutes * 60)
+        st.session_state.last_wall_time = time.monotonic()
         st.rerun()
-if st.sidebar.button("👤 Add simulated patient", use_container_width=True):
-    add_patient(); allocate_patients(); st.rerun()
 if st.sidebar.button("⚡ Simulate unexpected failure", use_container_width=True):
-    simulate_failure(); allocate_patients(); st.rerun()
+    simulate_failure(); st.rerun()
 if st.sidebar.button("🔄 Reset simulation", use_container_width=True):
     initialize(); st.rerun()
 
 st.title("🏥 MedFlow")
 st.caption("Hospital management and resource-allocation simulation")
-st.info(f"Simulation time: **{st.session_state.clock:%Y-%m-%d %H:%M:%S}** · Mode: **{st.session_state.mode}** · Evaluations: **{st.session_state.ticks}**")
+st.info(f"Simulation time: **{st.session_state.clock:%Y-%m-%d %H:%M:%S}** · Mode: **{st.session_state.mode}** · Speed: **{st.session_state.speed:g}×")
 
 st.subheader("Hospital resources")
 st.caption("Normal beds never fail. ICU failures are repaired in 1–3 simulated hours.")
@@ -239,17 +247,13 @@ for i, name in enumerate(st.session_state.resources):
 waiting = [p for p in st.session_state.patients if p["status"] == "Waiting"]
 admitted = [p for p in st.session_state.patients if p["status"] == "Admitted"]
 discharged = [p for p in st.session_state.patients if p["status"] == "Discharged"]
-refresh_waiting_times()
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("Waiting", len(waiting))
-m2.metric("Currently admitted", len(admitted))
-m3.metric("Average waiting time", f"{(sum(p['waiting_minutes'] for p in waiting) / len(waiting) if waiting else 0):.0f} min")
-m4.metric("Discharged", len(discharged))
+m1.metric("Waiting", len(waiting)); m2.metric("Currently admitted", len(admitted)); m3.metric("Average remaining wait", f"{(sum(p['waiting_seconds'] for p in waiting) / len(waiting) / 60 if waiting else 0):.0f} min"); m4.metric("Discharged", len(discharged))
 
 st.subheader("Patient flow")
 tab_wait, tab_admit, tab_dis, tab_res, tab_log = st.tabs(["🕒 Waiting list", "🛏️ Currently admitted", "✅ Discharged", "📊 Resource utilization", "📋 Event log"])
 with tab_wait:
-    rows = [{"#": i, "ID": p["id"], "Patient": p["name"], "Condition": p["condition"], "Acuity": p["acuity"], "Waiting": f"{p['waiting_minutes']} min", "Why waiting": p["reason"]} for i, p in enumerate(sorted(waiting, key=lambda p: (p["priority"], p["arrival"])), 1)]
+    rows = [{"#": i, "ID": p["id"], "Patient": p["name"], "Condition": p["condition"], "Acuity": p["acuity"], "Remaining wait": f"{p['waiting_seconds'] / 60:.1f} min", "Why waiting": p["reason"]} for i, p in enumerate(sorted(waiting, key=lambda p: (p["priority"], p["arrival"])), 1)]
     if rows:
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     else:
@@ -257,24 +261,19 @@ with tab_wait:
 with tab_admit:
     if admitted:
         ordered = sorted(admitted, key=lambda p: (DISCHARGE_PRIORITY.get(p["acuity"], 99), -stay_minutes(p)))
-        st.caption("Critical patients transfer from ICU to a normal bed after 120 minutes when available, then discharge after their condition-specific stay.")
         selected = st.multiselect("Patients to discharge", [p["id"] for p in ordered], format_func=lambda pid: next(f"{p['name']} ({pid}) — {p['location']} — {stay_minutes(p)} min" for p in ordered if p["id"] == pid), key="discharge_selection")
         if st.button("✅ Discharge selected patient(s)", type="primary", disabled=not selected):
-            discharge_selected(selected)
-            st.rerun()
-        rows = [{"ID": p["id"], "Patient": p["name"], "Condition": p["condition"], "Acuity": p["acuity"], "Location": p["location"], "Stay": f"{stay_minutes(p)} min", "Resources": ", ".join(f"{k}: {v}" for k, v in p["requirements"].items())} for p in ordered]
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            for pid in selected:
+                discharge_patient(pid)
+            allocate_patients(); st.rerun()
+        st.dataframe(pd.DataFrame([{ "ID": p["id"], "Patient": p["name"], "Condition": p["condition"], "Acuity": p["acuity"], "Location": p["location"], "Stay": f"{stay_minutes(p)} min", "Resources": ", ".join(f"{k}: {v}" for k, v in p["requirements"].items())} for p in ordered]), use_container_width=True, hide_index=True)
     else:
         st.warning("No patients are currently admitted.")
 with tab_dis:
     rows = [{"ID": p["id"], "Patient": p["name"], "Condition": p["condition"], "Discharged": p["discharged_at"].strftime("%H:%M:%S")} for p in discharged]
-    if rows:
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    else:
-        st.info("No patients have been discharged yet.")
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True) if rows else st.info("No patients have been discharged yet.")
 with tab_res:
-    rows = [{"Resource": name, "Total": resource["total"], "Used": current_usage(name), "Failed": resource["failed"], "Available": available_capacity(name), "Utilization": f"{(current_usage(name) / resource['total'] * 100) if resource['total'] else 0:.0f}%"} for name, resource in st.session_state.resources.items()]
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame([{ "Resource": name, "Total": resource["total"], "Used": current_usage(name), "Failed": resource["failed"], "Available": available_capacity(name), "Utilization": f"{(current_usage(name) / resource['total'] * 100) if resource['total'] else 0:.0f}%" } for name, resource in st.session_state.resources.items()]), use_container_width=True, hide_index=True)
 with tab_log:
     for event in st.session_state.event_log[:12]:
         st.write(f"• {event}")
@@ -283,5 +282,4 @@ shortages = [f"{resource['failed']} {name} failed" for name, resource in st.sess
 if any(p["acuity"] == "Critical" and p["status"] == "Waiting" for p in waiting):
     shortages.append("critical patient waiting")
 if shortages:
-    st.divider()
-    st.warning("⚠️ Silent alarm — " + "; ".join(shortages) + ". Review staffing or resource allocation.", icon="⚠️")
+    st.divider(); st.warning("⚠️ Silent alarm — " + "; ".join(shortages) + ". Review staffing or resource allocation.", icon="⚠️")
