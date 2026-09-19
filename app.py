@@ -34,6 +34,9 @@ CONDITIONS = [
     ("Infection", "Routine", 2, {"Beds": 1, "Doctors": 1, "Nurses": 1}),
 ]
 
+DISCHARGE_PRIORITY = {"Routine": 0, "Urgent": 1, "Critical": 2}
+DISCHARGE_MINUTES = {"Routine": 90, "Urgent": 150, "Critical": 240}
+
 
 def seed_patients():
     names = ["A. Patel", "B. Williams", "C. Garcia", "D. Chen", "E. Smith", "F. Okafor", "G. Jones", "H. Khan"]
@@ -64,7 +67,6 @@ def initialize():
 def ensure_state():
     if "patients" not in st.session_state:
         initialize()
-    # Keep sessions created by earlier versions compatible.
     for patient in st.session_state.patients:
         patient.setdefault("discharged_at", None)
 
@@ -94,6 +96,23 @@ def refresh_waiting_times():
     for patient in st.session_state.patients:
         if patient["status"] == "Waiting":
             patient["waiting_minutes"] = max(0, int((st.session_state.clock - patient["arrival"]).total_seconds() // 60))
+
+
+def patient_stay_minutes(patient):
+    if patient["status"] != "Admitted" or patient["admitted_at"] is None:
+        return 0
+    return max(0, int((st.session_state.clock - patient["admitted_at"]).total_seconds() // 60))
+
+
+def discharge_priority(patient):
+    return (DISCHARGE_PRIORITY.get(patient["acuity"], 99), -patient_stay_minutes(patient), patient["admitted_at"] or st.session_state.clock)
+
+
+def recommend_discharge_candidates():
+    return sorted(
+        [patient for patient in st.session_state.patients if patient["status"] == "Admitted"],
+        key=discharge_priority,
+    )
 
 
 def allocate_patients():
@@ -133,6 +152,19 @@ def discharge_selected(patient_ids):
     return count
 
 
+def auto_discharge_patients():
+    """Discharge stable patients after required stay length and with the longest admissions first."""
+    discharged_count = 0
+    for patient in recommend_discharge_candidates():
+        min_minutes = DISCHARGE_MINUTES.get(patient["acuity"], 9999)
+        if patient_stay_minutes(patient) >= min_minutes:
+            if discharge_patient(patient["id"]):
+                discharged_count += 1
+    if discharged_count:
+        allocate_patients()
+    return discharged_count
+
+
 def add_patient():
     index = len(st.session_state.patients) + 1
     condition, acuity, priority, requirements = random.choice(CONDITIONS)
@@ -164,6 +196,7 @@ def advance_simulation():
         st.session_state.event_log.insert(0, "A new emergency arrival entered the waiting list.")
     if random.random() < 0.18:
         simulate_failure()
+    auto_discharge_patients()
     admitted_count = allocate_patients()
     st.session_state.event_log.insert(0, f"Advanced to {st.session_state.clock:%H:%M}; admitted {admitted_count} patient(s).")
 
@@ -239,13 +272,32 @@ with tab_waiting:
 
 with tab_admitted:
     if admitted:
-        st.caption("Select one or more patients, then discharge them. All resources assigned to them are immediately released and waiting patients are re-evaluated.")
-        selected = st.multiselect("Patients to discharge", options=[p["id"] for p in admitted], format_func=lambda patient_id: next(p["name"] + " (" + patient_id + ")" for p in admitted if p["id"] == patient_id), key="discharge_selection")
+        sorted_admitted = sorted(admitted, key=discharge_priority)
+        st.caption("Discharge order is based on condition severity and length of stay: the least critical patients with the longest admission time are recommended first.")
+        selected = st.multiselect(
+            "Patients to discharge",
+            options=[p["id"] for p in sorted_admitted],
+            format_func=lambda patient_id: next(
+                f"{p['name']} ({p['id']}) — {p['acuity']} — {patient_stay_minutes(p)} min admitted"
+                for p in sorted_admitted
+                if p["id"] == patient_id
+            ),
+            key="discharge_selection",
+        )
         if st.button("✅ Discharge selected patient(s)", type="primary", disabled=not selected):
             count = discharge_selected(selected)
             st.success(f"Discharged {count} patient(s); their resources are now available.")
             st.rerun()
-        rows = [{"ID": p["id"], "Patient": p["name"], "Condition": p["condition"], "Acuity": p["acuity"], "Admitted": p["admitted_at"].strftime("%H:%M"), "Resources": ", ".join(f"{k}: {v}" for k, v in p["requirements"].items())} for p in admitted]
+        rows = [{
+            "Priority": DISCHARGE_PRIORITY.get(p["acuity"], 99),
+            "ID": p["id"],
+            "Patient": p["name"],
+            "Condition": p["condition"],
+            "Acuity": p["acuity"],
+            "Admitted": p["admitted_at"].strftime("%H:%M"),
+            "Stay": f"{patient_stay_minutes(p)} min",
+            "Resources": ", ".join(f"{k}: {v}" for k, v in p["requirements"].items()),
+        } for p in sorted_admitted]
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     else:
         st.warning("No patients are currently admitted.")
