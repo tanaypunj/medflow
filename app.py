@@ -169,7 +169,7 @@ def mode_capacity(name):
 def effective_capacity(name, resources=None):
     resources = st.session_state.resources if resources is None else resources
     resource = resources[name]
-    return max(0, mode_capacity(name) if resources is st.session_state.resources else int(resource["total"]) - len(resource["repairs"])) - (failed_units(name) if resources is st.session_state.resources else len(resource["repairs"])) if resources is st.session_state.resources else max(0, int(resource["total"]) - len(resource["repairs"]))
+    return max(0, mode_capacity(name) if resources is st.session_state.resources else int(resource["total"]) - len(resource["repairs"])) - (failed_units(name) if resources is st.session_state.resources else 0)
 
 
 def usage_snapshot(patients=None):
@@ -287,7 +287,6 @@ def transfer_critical_patients():
     for patient in st.session_state.patients:
         if patient["status"] != "Admitted" or patient["acuity"] != "Critical" or patient["location"] != "ICU" or stay_minutes(patient) < CRITICAL_TRANSFER_MINUTES:
             continue
-        # The ICU bed and ventilator are released by changing requirements.
         if available_capacity("Beds", usage) < 1:
             continue
         patient["requirements"] = patient["base_requirements"].copy()
@@ -522,12 +521,12 @@ m3.metric("Average waiting time", f"{avg_wait:.1f} min")
 m4.metric("Patients treated", st.session_state.treated_total)
 
 st.subheader("Patient flow")
-tab_wait, tab_admit, tab_dis, tab_res, tab_stats, tab_compare, tab_log = st.tabs(["🕒 Waiting list", "🛏️ Currently admitted", "✅ Discharged", "📊 Resource utilization", "📈 Statistics", "⚖️ Strategy Comparison", "📋 Event log"])
+tab_wait, tab_admit, tab_dis, tab_res, tab_stats, tab_compare, tab_log = st.tabs(["🕒 Waiting list", "🛏️ Currently admitted", "✅ Discharged", "📊 Resource utilization", "📈 Statistics", "⚖️ Strategy comparison", "📝 Event log"])
 with tab_wait:
     rows = []
     for i, patient in enumerate(sorted(waiting, key=patient_priority, reverse=True)[:200], 1):
         breakdown = priority_breakdown(patient)
-        rows.append({"#": i, "ID": patient["id"], "Patient": patient["name"], "Condition": patient["condition"], "Acuity": patient["acuity"], "Priority P": f"{breakdown['Final Priority']:.1f}", "Urgency": f"{breakdown['Urgency contribution']:.0f}", "Wait": f"{breakdown['Waiting contribution']:.1f}", "Resource": f"{breakdown['Resource contribution']:.0f}", "Queue wait": f"{patient['queue_wait_seconds'] / 60:.1f} min", "Reason": patient["reason"]})
+        rows.append({"#": i, "ID": patient["id"], "Patient": patient["name"], "Condition": patient["condition"], "Acuity": patient["acuity"], "Priority P": f"{breakdown['Final Priority']:.1f}", "Wait": f"{patient['queue_wait_seconds'] / 60:.1f} min", "Reason": patient["reason"]})
     if rows:
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     else:
@@ -548,17 +547,17 @@ with tab_admit:
                 discharge_patient(pid)
             allocate_patients()
             st.rerun()
-        st.dataframe(pd.DataFrame([{ "ID": p["id"], "Patient": p["name"], "Condition": p["condition"], "Acuity": p["acuity"], "Location": p["location"], "Stay": f"{stay_minutes(p)} min", "Priority P": f"{priority_breakdown(p)['Final Priority']:.1f}" } for p in ordered]), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame([{"ID": p["id"], "Patient": p["name"], "Condition": p["condition"], "Acuity": p["acuity"], "Location": p["location"], "Stay": f"{stay_minutes(p)} min", "Priority P": f"{priority_breakdown(p)['Final Priority']:.1f}"} for p in ordered]), use_container_width=True, hide_index=True)
     else:
         st.warning("No patients are currently admitted.")
 with tab_dis:
     recent = sorted((p for p in discharged if p["discharged_at"]), key=lambda p: p["discharged_at"], reverse=True)[:200]
     if recent:
-        st.dataframe(pd.DataFrame([{ "ID": p["id"], "Patient": p["name"], "Condition": p["condition"], "Acuity": p["acuity"], "Queue wait": f"{p['queue_wait_seconds'] / 60:.1f} min", "Discharged": p["discharged_at"].strftime("%H:%M:%S") } for p in recent]), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame([{"ID": p["id"], "Patient": p["name"], "Condition": p["condition"], "Acuity": p["acuity"], "Queue wait": f"{p['queue_wait_seconds'] / 60:.1f} min", "Discharged": p["discharged_at"].strftime("%Y-%m-%d %H:%M:%S")} for p in recent]), use_container_width=True, hide_index=True)
     else:
         st.info("No patients have been discharged yet.")
 with tab_res:
-    st.dataframe(pd.DataFrame([{ "Resource": name, "Base total": st.session_state.base_resource_totals[name], "Mode capacity": mode_capacity(name), "Effective": effective_capacity(name), "Failed": failed_units(name), "Used": usage.get(name, 0), "Available": available_capacity(name, usage), "Utilization": f"{utilization(name, usage):.0f}%" } for name in RESOURCE_NAMES]), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame([{"Resource": name, "Base total": st.session_state.base_resource_totals[name], "Mode capacity": mode_capacity(name), "Effective": effective_capacity(name), "Failed units": failed_units(name), "Used": usage.get(name, 0), "Utilization": f"{utilization(name, usage):.0f}%"} for name in RESOURCE_NAMES]), use_container_width=True, hide_index=True)
 with tab_stats:
     history = pd.DataFrame(st.session_state.metrics_history)
     critical_waiting = sum(p["acuity"] == "Critical" for p in waiting)
@@ -580,28 +579,19 @@ with tab_stats:
     else:
         st.info("Statistics will appear after the simulation advances.")
 with tab_compare:
-    def snapshot(strategy):
-        simulated = deepcopy(st.session_state.patients)
-        waiting_copy = [p for p in simulated if p["status"] == "Waiting"]
-        usage_copy = usage_snapshot(simulated)
-        order = sorted(waiting_copy, key=(lambda p: p["urgency"] * 10) if strategy == "Urgency Only" else patient_priority, reverse=True)
-        admitted_count = 0
-        for patient in order:
-            if any(effective_capacity(name) - usage_copy.get(name, 0) < needed for name, needed in patient["requirements"].items()):
-                continue
-            for name, needed in patient["requirements"].items():
-                usage_copy[name] += needed
-            patient["status"] = "Admitted"
-            admitted_count += 1
-        remaining = [p for p in simulated if p["status"] == "Waiting"]
-        waits = [p["queue_wait_seconds"] / 60 for p in remaining]
-        utils = [utilization(name, usage_copy) for name in RESOURCE_NAMES]
-        return {"Average Wait": sum(waits) / len(waits) if waits else 0, "Maximum Wait": max(waits, default=0), "Critical Wait": sum(p["queue_wait_seconds"] / 60 for p in remaining if p["acuity"] == "Critical"), "Patients Treated": admitted_count, "Throughput": admitted_count, "Average Resource Utilization": sum(utils) / len(utils)}
-    comparison = {"Urgency Only": snapshot("Urgency Only"), "MEDFLOW": snapshot("MEDFLOW")}
-    comparison_df = pd.DataFrame([{ "Metric": metric, "Urgency Only": comparison["Urgency Only"][metric], "MEDFLOW": comparison["MEDFLOW"][metric] } for metric in comparison["MEDFLOW"]])
+    comparison = {
+        "Urgency Only": strategy_snapshot("Urgency Only"),
+        "MEDFLOW": strategy_snapshot("MEDFLOW"),
+    }
+    comparison_df = pd.DataFrame([
+        {"Metric": metric, "Urgency Only": comparison["Urgency Only"][metric], "MEDFLOW": comparison["MEDFLOW"][metric]}
+        for metric in comparison["MEDFLOW"]
+    ])
     st.dataframe(comparison_df, use_container_width=True, hide_index=True)
     st.bar_chart(comparison_df.set_index("Metric"), use_container_width=True)
-    st.caption("Both strategies use the same current patient/resource snapshot; only the scheduling rule changes.")
+    if comparison["Urgency Only"] == comparison["MEDFLOW"]:
+        st.info("These strategies are producing the same result under the current snapshot. Increase pressure (more arrivals or lower capacity) to expose the policy difference.")
+    st.caption("The comparison uses an isolated snapshot of the current hospital state. Urgency-only prioritizes the highest-acuity patients; MEDFLOW also factors in queue wait and resource criticality.")
 with tab_log:
     for event in st.session_state.event_log[:12]:
         st.write(f"• {event}")
