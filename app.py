@@ -7,6 +7,8 @@ import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
+from arrival_patterns import ARRIVAL_PATTERNS, arrival_pattern_config, next_arrival_minutes
+
 st.set_page_config(page_title="MedFlow", page_icon="🏥", layout="wide")
 
 STEP_SECONDS = 30
@@ -131,6 +133,7 @@ def initialize():
     ss.last_wall_time = time.monotonic()
     ss.metrics_history = []
     ss.ambulance_count = DEFAULT_AMBULANCE_COUNT
+    ss.arrival_pattern = "Steady"
     ss.custom_interval = 20.0
     ss.custom_ambulance_share = 0.45
     ss.custom_weights = {"Critical": 4, "Urgent": 4, "Routine": 2}
@@ -154,6 +157,7 @@ def ensure_state():
     ss.setdefault("last_wall_time", time.monotonic())
     ss.setdefault("metrics_history", [])
     ss.setdefault("ambulance_count", DEFAULT_AMBULANCE_COUNT)
+    ss.setdefault("arrival_pattern", "Steady")
     ss.setdefault("custom_interval", 20.0)
     ss.setdefault("custom_ambulance_share", 0.45)
     ss.setdefault("custom_weights", {"Critical": 4, "Urgent": 4, "Routine": 2})
@@ -176,12 +180,19 @@ def mode_config():
     weights = CONDITION_WEIGHTS.get(ss.mode, CONDITION_WEIGHTS["Normal"])
     interval = ARRIVAL_INTERVALS.get(ss.mode, 20)
     ambulance_share = ambulance_arrival_share()
+    pattern = ss.get("arrival_pattern", "Steady")
     if ss.mode == "Custom":
         interval = max(0.5, float(ss.custom_interval))
         weights = [ss.custom_weights.get(acuity, 1) for _, acuity, _, _ in CONDITIONS]
         factors = {name: min(0.95, max(0.0, value)) for name, value in ss.custom_factors.items()}
         ambulance_share = min(1.0, max(0.0, float(ss.custom_ambulance_share)))
-    return {"interval": interval, "weights": weights, "factors": factors, "ambulance_share": ambulance_share}
+    return {
+        "interval": interval,
+        "weights": weights,
+        "factors": factors,
+        "ambulance_share": ambulance_share,
+        "arrival_pattern": pattern,
+    }
 
 
 def scenario_summary():
@@ -189,10 +200,12 @@ def scenario_summary():
     reduced = [f"{name}: {factor * 100:.0f}% reduced" for name, factor in config["factors"].items() if factor]
     acuity = "High" if st.session_state.mode in ("Emergency surge", "Disaster") else "Normal"
     arrival = "Very high" if config["interval"] <= 2 else "High" if config["interval"] <= 5 else "Normal"
+    pattern_name = config.get("arrival_pattern", "Steady")
     return {
         "Arrival rate": f"{arrival} (every {config['interval']:.1f} min)",
         "Patient acuity": acuity,
         "Ambulance share": f"{config['ambulance_share'] * 100:.0f}%",
+        "Arrival pattern": pattern_name,
         "Resource pressure": ", ".join(reduced) or "Normal capacity",
     }
 
@@ -352,7 +365,10 @@ def auto_discharge():
 
 
 def arrival_interval():
-    return max(0.1, float(mode_config()["interval"]))
+    base = max(0.1, float(mode_config()["interval"]))
+    pattern = st.session_state.get("arrival_pattern", "Steady")
+    simulated_hour = st.session_state.clock.hour + (st.session_state.clock.minute / 60.0)
+    return next_arrival_minutes(pattern, base, simulated_hour=simulated_hour)
 
 
 def add_patient():
@@ -505,6 +521,8 @@ ensure_state()
 st.sidebar.title("⚙️ Simulation controls")
 st.sidebar.selectbox("Operating mode", list(MODE_LABELS), key="mode", format_func=lambda x: f"{x} — {MODE_LABELS[x]}", on_change=reset_arrival_accumulator)
 st.sidebar.number_input("Ambulance fleet", 0, 25, key="ambulance_count", step=1)
+pattern_options = list(ARRIVAL_PATTERNS)
+st.sidebar.selectbox("Arrival pattern", pattern_options, key="arrival_pattern", format_func=lambda x: arrival_pattern_config(x)["label"])
 st.sidebar.caption("Normal mode: most arrivals are walk-ins; emergency modes send a much larger share by ambulance.")
 if st.session_state.mode == "Custom":
     st.sidebar.number_input("Minutes between arrivals", 0.5, 240.0, key="custom_interval", step=0.5)
