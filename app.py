@@ -45,7 +45,7 @@ def patient_record(pid, name, condition, acuity, urgency, requirements, arrival,
         "admitted_at": None,
         "discharged_at": None,
         "waiting_seconds": float(initial_wait),
-        "waiting_elapsed_seconds": 0.0,
+        "waiting_elapsed_seconds": float(initial_wait),
         "reason": "Not yet assessed",
     }
 
@@ -88,7 +88,7 @@ def ensure_state():
         initialize()
     for patient in st.session_state.patients:
         patient.setdefault("waiting_seconds", patient.get("waiting_minutes", 0) * 60)
-        patient.setdefault("waiting_elapsed_seconds", 0.0)
+        patient.setdefault("waiting_elapsed_seconds", patient.get("waiting_seconds", 0.0))
         patient.setdefault("location", "Waiting list")
         patient.setdefault("base_requirements", patient.get("requirements", {}).copy())
         patient.setdefault("discharged_at", None)
@@ -100,9 +100,7 @@ def ensure_state():
     st.session_state.setdefault("last_wall_time", time.monotonic())
     st.session_state.setdefault("metrics_history", [])
 
-    for patient in st.session_state.patients:
-        if patient["status"] == "Waiting" and not can_admit(patient):
-            patient["waiting_seconds"] = max(0, patient["waiting_seconds"])
+    # Actual queue wait grows while waiting. Admission depends on resource availability, not an arbitrary countdown.
     allocate_patients()
 
 
@@ -132,7 +130,7 @@ def resource_criticality(patient):
 
 
 def patient_priority(patient):
-    """P = U×10 + W×1 + R×2; W is elapsed waiting time in minutes."""
+    """P = U×10 + W×1 + R×2; W is actual queue wait in minutes."""
     return patient["urgency"] * 10 + (patient["waiting_elapsed_seconds"] / 60) + resource_criticality(patient) * 2
 
 
@@ -166,11 +164,9 @@ def allocate_patients():
     count = 0
     waiting = sorted((p for p in st.session_state.patients if p["status"] == "Waiting"), key=patient_priority, reverse=True)
     for patient in waiting:
-        if patient["waiting_seconds"] > 0:
-            continue
         blocked = can_admit(patient)
         if blocked:
-            patient["reason"] = "Ready, but waiting for " + ", ".join(blocked)
+            patient["reason"] = "Waiting for " + ", ".join(blocked)
             continue
         patient["status"] = "Admitted"
         patient["location"] = "ICU" if patient["acuity"] == "Critical" and "ICU beds" in patient["requirements"] else "Normal bed"
@@ -251,9 +247,9 @@ def simulate_failure():
     if name == "ICU beds":
         hours = random.randint(1, 3)
         resource["repair_at"] = st.session_state.clock + timedelta(hours=hours)
-        message = f"Unexpected ICU failure; repair due in {hours} simulated hour(s). Waiting progress is reduced until repair."
+        message = f"Unexpected ICU failure; repair due in {hours} simulated hour(s). Queue wait grows until the ICU is repaired."
     else:
-        message = f"Unexpected failure: one {name} became unavailable. Waiting progress is reduced until recovery."
+        message = f"Unexpected failure: one {name} became unavailable. Queue wait grows until recovery."
     st.session_state.event_log.insert(0, message)
 
 
@@ -278,16 +274,15 @@ def record_metrics():
 
 
 def advance_simulation(simulated_seconds):
-    """Advance in 30-second steps; failures correctly pause affected patients' wait countdown."""
+    """Advance in 30-second steps. Waiting time strictly increases while a patient is queued."""
     steps = max(1, int(simulated_seconds // 30))
     for _ in range(steps):
         st.session_state.clock += timedelta(seconds=30)
         for patient in st.session_state.patients:
             if patient["status"] == "Waiting":
-                factor = wait_progress_factor(patient)
                 patient["waiting_elapsed_seconds"] += 30
-                patient["waiting_seconds"] = max(0, patient["waiting_seconds"] - 30 * factor)
-                patient["reason"] = doctor_wait_message(patient) or ("Waiting for required resources" if factor < 1 else "Waiting for admission time")
+                patient["waiting_seconds"] = patient["waiting_elapsed_seconds"]
+                patient["reason"] = doctor_wait_message(patient) or "Waiting in queue"
         st.session_state.arrival_accumulator += 30 / 60
         interval = ARRIVAL_INTERVALS[st.session_state.mode]
         while st.session_state.arrival_accumulator >= interval:
@@ -328,7 +323,7 @@ st.session_state.speed = st.sidebar.number_input(
     format="%.1f",
     help="Simulated time multiplier. Maximum 500×.",
 )
-st.sidebar.caption("Patients are admitted when their waiting countdown reaches zero and the required resources are available.")
+st.sidebar.caption("Queue wait grows while a patient is waiting; admission occurs as soon as the required resources are free.")
 
 skip_columns = st.sidebar.columns(5)
 for column, minutes in zip(skip_columns, (1, 5, 10, 15, 20)):
@@ -348,7 +343,7 @@ st.caption("Hospital management and resource-allocation simulation")
 st.info(f"Simulation time: **{st.session_state.clock:%Y-%m-%d %H:%M:%S}** · Mode: **{st.session_state.mode}** · Speed: **{st.session_state.speed:.1f}×")
 
 st.subheader("Hospital resources")
-st.caption("Priority formula: P = U×10 + W×1 + R×2, where W is elapsed waiting time in minutes.")
+st.caption("Priority formula: P = U×10 + W×1 + R×2, where W is elapsed queue wait in minutes.")
 resource_columns = st.columns(3)
 for i, name in enumerate(st.session_state.resources):
     resource = st.session_state.resources[name]
@@ -378,7 +373,7 @@ with tab_wait:
         "Condition": p["condition"],
         "Acuity": p["acuity"],
         "Priority P": f"{patient_priority(p):.1f}",
-        "Remaining wait": f"{p['waiting_seconds'] / 60:.1f} min",
+        "Queue wait": f"{p['waiting_seconds'] / 60:.1f} min",
         "Reason": p["reason"],
     } for i, p in enumerate(sorted(waiting, key=patient_priority, reverse=True), start=1)]
     if rows:
@@ -416,7 +411,7 @@ with tab_dis:
         "Patient": p["name"],
         "Condition": p["condition"],
         "Acuity": p["acuity"],
-        "Waiting time": f"{p['waiting_elapsed_seconds'] / 60:.1f} min",
+        "Queue wait": f"{p['waiting_elapsed_seconds'] / 60:.1f} min",
         "Discharged": p["discharged_at"].strftime("%H:%M:%S"),
     } for p in discharged if p.get("discharged_at")]
     if discharged_rows:
