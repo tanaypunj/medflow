@@ -64,7 +64,7 @@ def seed_patients():
             urgency,
             requirements,
             now - timedelta(minutes=(i + 1) * 12),
-            (i + 1) * 12 * 60,
+            0,
         )
         patients.append(patient)
     return patients
@@ -99,6 +99,11 @@ def ensure_state():
     st.session_state.setdefault("arrival_accumulator", 0.0)
     st.session_state.setdefault("last_wall_time", time.monotonic())
     st.session_state.setdefault("metrics_history", [])
+
+    for patient in st.session_state.patients:
+        if patient["status"] == "Waiting" and not can_admit(patient):
+            patient["waiting_seconds"] = max(0, patient["waiting_seconds"])
+    allocate_patients()
 
 
 def effective_capacity(name):
